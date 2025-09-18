@@ -20,52 +20,6 @@ app.set('trust proxy', true);
 const STORAGE_DIR = path.join(__dirname, 'data');
 if (!fs.existsSync(STORAGE_DIR)) {
     try {
-    // 前缀去重与重试机制
-    const { prefix: desiredPrefix, strategy = 'incremental', autoSelect, service } = req.body || {};
-    const MAX_TRIES = 20;
-    let attempt = 0;
-
-    function makeRandomPrefix() {
-      const n = Math.floor(Math.random() * 1000);
-      return `kpay${String(n).padStart(3, '0')}`;
-    }
-
-    let basePrefix = desiredPrefix && typeof desiredPrefix === 'string' && desiredPrefix.trim()
-      ? desiredPrefix.trim().toLowerCase()
-      : makeRandomPrefix();
-
-    // 如果 incremental，需要在冲突时递增序号；若 basePrefix 已带尾号，按数字部分+1
-    const prefixParts = basePrefix.match(/^(.*?)(\d+)?$/);
-    const head = prefixParts ? (prefixParts[1] || basePrefix) : basePrefix;
-    let num = prefixParts && prefixParts[2] ? parseInt(prefixParts[2], 10) : 1;
-
-    let finalPrefix = basePrefix;
-
-    // 读取当前存储，检查是否已存在
-    const storage = readEmailStorage(); // { [accountId]: { email, service, ... } }
-    const existsPrefix = (p) => {
-      const lower = `${p}@`;
-      return Object.values(storage).some(acc => typeof acc.email === 'string' && acc.email.toLowerCase().startsWith(lower));
-    };
-
-    while (attempt < MAX_TRIES && existsPrefix(finalPrefix)) {
-      attempt++;
-      if (strategy === 'random') {
-        finalPrefix = makeRandomPrefix();
-      } else {
-        // incremental
-        num++;
-        finalPrefix = `${head}${String(num).padStart(3, '0')}`;
-      }
-    }
-
-    if (existsPrefix(finalPrefix)) {
-      return res.status(409).json({ success: false, message: '邮箱前缀已存在，请稍后重试或更换策略/前缀' });
-    }
-
-    // 将 req.body.prefix 规范化为最终可用前缀，供后续服务创建使用
-    if (!req.body) req.body = {};
-    req.body.prefix = finalPrefix;
         fs.mkdirSync(STORAGE_DIR, { recursive: true });
     } catch (e) {
         console.error('创建存储目录失败:', e.message);
@@ -666,10 +620,10 @@ app.post('/api/check-services', async (req, res) => {
     }
 });
 
-// 创建邮箱
+ // 创建邮箱
 app.post('/api/create-email', async (req, res) => {
     try {
-        const { service: preferredService, customPrefix, autoSelect } = req.body || {};
+        const { service: preferredService, customPrefix, autoSelect, prefix, strategy = 'incremental' } = req.body || {};
         
         // 智能选择：优先 mailtm → onesecmail → guerrillamail → snapmail
         let serviceKey = preferredService || (autoSelect ? selectAvailableService() : selectAvailableService());
@@ -682,22 +636,41 @@ app.post('/api/create-email', async (req, res) => {
         
         console.log(`使用服务创建邮箱: ${service.name}`);
         
-        // 生成唯一的kpay前缀
-        let emailPrefix = customPrefix;
-        if (!emailPrefix) {
-            emailPrefix = generateUniqueKpayPrefix();
-        } else {
-            // 验证自定义前缀的唯一性
-            if (!isEmailPrefixUnique(emailPrefix)) {
-                return res.status(400).json({
-                    success: false,
-                    message: '邮箱前缀已存在，请使用其他前缀'
-                });
+        // 统一前缀生成 + 去重重试（支持 customPrefix 或 prefix）
+        const MAX_TRIES = 20;
+        function makeRandomPrefix() {
+            const n = Math.floor(Math.random() * 1000);
+            return `kpay${String(n).padStart(3, '0')}`;
+        }
+        let base = (customPrefix || prefix || '').toString().trim().toLowerCase();
+        if (!base) base = generateUniqueKpayPrefix(); // 有一定唯一性起点
+        const m = base.match(/^(.*?)(\d+)?$/);
+        const head = m ? (m[1] || base) : base;
+        let num = m && m[2] ? parseInt(m[2], 10) : 1;
+        let finalPrefix = base;
+        
+        const storage = readEmailStorage();
+        const existed = (p) => {
+            const lower = `${p}@`;
+            return Object.values(storage).some(a => a.email && a.email.toLowerCase().startsWith(lower));
+        };
+        
+        let tries = 0;
+        while (tries < MAX_TRIES && existed(finalPrefix)) {
+            tries++;
+            if (strategy === 'random') {
+                finalPrefix = makeRandomPrefix();
+            } else {
+                num++;
+                finalPrefix = `${head}${String(num).padStart(3, '0')}`;
             }
+        }
+        if (existed(finalPrefix)) {
+            return res.status(409).json({ success: false, message: '邮箱前缀已存在，请稍后重试或更换前缀/策略' });
         }
         
         // 创建邮箱
-        const emailData = await service.createEmail(emailPrefix);
+        const emailData = await service.createEmail(finalPrefix);
         
         // 保存邮箱信息到存储
         const storage = readEmailStorage();
@@ -706,7 +679,7 @@ app.post('/api/create-email', async (req, res) => {
             email: emailData.email,
             token: emailData.token,
             service: emailData.service,
-            prefix: emailData.prefix || emailPrefix,
+            prefix: emailData.prefix || finalPrefix,
             createdAt: new Date().toISOString(),
             emails: []
         };
@@ -720,7 +693,7 @@ app.post('/api/create-email', async (req, res) => {
             serviceName: service.name,
             availableDomains: service.domains,
             accountId: accountId,
-            prefix: emailData.prefix || emailPrefix
+            prefix: emailData.prefix || finalPrefix
         });
     } catch (error) {
         console.error('创建邮箱失败:', error);
