@@ -1,0 +1,133 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>临时邮箱</title>
+    <link rel="stylesheet" href="styles.css">
+    <link rel="stylesheet" href="https://cdnjs.cloudflare.com/ajax/libs/font-awesome/6.0.0/css/all.min.css">
+</head>
+<body>
+    <div class="app-container">
+        <!-- 左侧邮箱列表 -->
+        <div class="sidebar">
+            <div class="sidebar-header">
+                <div class="logo">
+                    <i class="fas fa-envelope"></i>
+                    <span class="logo-text">临时邮箱</span>
+                    <span class="version">v1.0</span>
+                </div>
+            </div>
+            
+            <div class="email-actions">
+                <button id="createEmailBtn" class="create-email-btn">
+                    <i class="fas fa-plus"></i>
+                    创建新邮箱
+                </button>
+                <button id="refreshAllBtn" class="refresh-all-btn">
+                    <i class="fas fa-sync-alt"></i>
+                    全部刷新
+                </button>
+            </div>
+
+            <div class="email-accounts">
+                <div id="emailAccountsList" class="email-accounts-list">
+                    <!-- 邮箱账户列表将在这里动态生成 -->
+                </div>
+            </div>
+        </div>
+
+        <!-- 右侧邮件内容 -->
+        <div class="main-content">
+            <div class="content-header">
+                <div class="current-email-info">
+                    <span id="currentEmailAddress" class="current-email">请选择或创建邮箱</span>
+                    <div class="email-actions-right">
+                        <button id="copyEmailBtn" class="action-btn" title="复制邮箱地址" style="display: none;">
+                            <i class="fas fa-copy"></i>
+                        </button>
+                        <button id="refreshEmailBtn" class="action-btn" title="刷新邮件" style="display: none;">
+                            <i class="fas fa-sync-alt"></i>
+                        </button>
+                        <button id="deleteEmailBtn" class="action-btn delete" title="删除邮箱" style="display: none;">
+                            <i class="fas fa-trash"></i>
+                        </button>
+                    </div>
+                </div>
+            </div>
+
+            <div class="content-body">
+                <div id="emailsList" class="emails-list">
+                    <div class="welcome-message">
+                        <i class="fas fa-envelope-open-text"></i>
+                        <h3>欢迎使用临时邮箱服务</h3>
+                        <p>点击左侧"创建新邮箱"开始使用</p>
+                    </div>
+                </div>
+            </div>
+
+            <!-- 验证码检测面板 -->
+            <div id="verificationPanel" class="verification-panel" style="display: none;">
+                <div class="panel-header">
+                    <h4><i class="fas fa-key"></i> 验证码检测</h4>
+                    <button id="closeVerificationBtn" class="close-btn">
+                        <i class="fas fa-times"></i>
+                    </button>
+                </div>
+                <div class="panel-content">
+                    <div id="verificationResult" class="verification-result">
+                        <div class="no-verification">暂无验证码</div>
+                    </div>
+                </div>
+            </div>
+        </div>
+    </div>
+
+    <!-- 邮件详情模态框 -->
+    <div id="emailModal" class="modal" style="display: none;">
+        <div class="modal-content">
+            <div class="modal-header">
+                <h3 id="modalSubject">邮件详情</h3>
+                <button id="closeModalBtn" class="close-btn">
+                    <i class="fas fa-times"></i>
+                </button>
+            </div>
+            <div class="modal-body">
+                <div class="email-meta">
+                    <div class="meta-item">
+                        <strong>发件人：</strong>
+                        <span id="modalFrom"></span>
+                    </div>
+                    <div class="meta-item">
+                        <strong>时间：</strong>
+                        <span id="modalDate"></span>
+                    </div>
+                </div>
+                <div class="email-content">
+                    <div id="modalContent"></div>
+                </div>
+                <div class="email-verification" id="modalVerification" style="display: none;">
+                    <div class="verification-code">
+                        <i class="fas fa-key"></i>
+                        <strong>检测到验证码：</strong>
+                        <span id="modalVerificationCode" class="code"></span>
+                        <button id="copyCodeBtn" class="copy-code-btn">
+                            <i class="fas fa-copy"></i>
+                        </button>
+                    </div>
+                </div>
+            </div>
+        </div>
+    </div>
+
+    <!-- 通知提示 -->
+    <div id="notification" class="notification" style="display: none;">
+        <div class="notification-content">
+            <i class="fas fa-check-circle"></i>
+            <span id="notificationText"></span>
+        </div>
+    </div>
+
+    <script src="script.js"></script>
+</body>
+</html>
