@@ -14,9 +14,67 @@ app.use(express.json());
 app.use(express.static('.'));
 app.set('trust proxy', true);
 
+/**
+ * 固定存储目录，避免工作目录变化导致写入失败
+ */
+const STORAGE_DIR = path.join(__dirname, 'data');
+if (!fs.existsSync(STORAGE_DIR)) {
+    try {
+    // 前缀去重与重试机制
+    const { prefix: desiredPrefix, strategy = 'incremental', autoSelect, service } = req.body || {};
+    const MAX_TRIES = 20;
+    let attempt = 0;
+
+    function makeRandomPrefix() {
+      const n = Math.floor(Math.random() * 1000);
+      return `kpay${String(n).padStart(3, '0')}`;
+    }
+
+    let basePrefix = desiredPrefix && typeof desiredPrefix === 'string' && desiredPrefix.trim()
+      ? desiredPrefix.trim().toLowerCase()
+      : makeRandomPrefix();
+
+    // 如果 incremental，需要在冲突时递增序号；若 basePrefix 已带尾号，按数字部分+1
+    const prefixParts = basePrefix.match(/^(.*?)(\d+)?$/);
+    const head = prefixParts ? (prefixParts[1] || basePrefix) : basePrefix;
+    let num = prefixParts && prefixParts[2] ? parseInt(prefixParts[2], 10) : 1;
+
+    let finalPrefix = basePrefix;
+
+    // 读取当前存储，检查是否已存在
+    const storage = readEmailStorage(); // { [accountId]: { email, service, ... } }
+    const existsPrefix = (p) => {
+      const lower = `${p}@`;
+      return Object.values(storage).some(acc => typeof acc.email === 'string' && acc.email.toLowerCase().startsWith(lower));
+    };
+
+    while (attempt < MAX_TRIES && existsPrefix(finalPrefix)) {
+      attempt++;
+      if (strategy === 'random') {
+        finalPrefix = makeRandomPrefix();
+      } else {
+        // incremental
+        num++;
+        finalPrefix = `${head}${String(num).padStart(3, '0')}`;
+      }
+    }
+
+    if (existsPrefix(finalPrefix)) {
+      return res.status(409).json({ success: false, message: '邮箱前缀已存在，请稍后重试或更换策略/前缀' });
+    }
+
+    // 将 req.body.prefix 规范化为最终可用前缀，供后续服务创建使用
+    if (!req.body) req.body = {};
+    req.body.prefix = finalPrefix;
+        fs.mkdirSync(STORAGE_DIR, { recursive: true });
+    } catch (e) {
+        console.error('创建存储目录失败:', e.message);
+    }
+}
+
 // 邮件存储文件
-const EMAIL_STORAGE_FILE = 'email_storage.json';
-const SERVICE_STATUS_FILE = 'service_status.json';
+const EMAIL_STORAGE_FILE = path.join(STORAGE_DIR, 'email_storage.json');
+const SERVICE_STATUS_FILE = path.join(STORAGE_DIR, 'service_status.json');
 
 // 第三方邮件服务配置
 const EMAIL_SERVICES = {
@@ -54,12 +112,18 @@ const EMAIL_SERVICES = {
                 if (!emailAddress) {
                     throw new Error('Snapmail需要邮箱地址参数');
                 }
-                
-                console.log(`从Snapmail获取邮件: ${emailAddress}`);
-                
+
+                // 规范化：isPrefix=true 时传前缀而非完整地址
+                let queryPrefix = emailAddress;
+                if (typeof queryPrefix === 'string' && queryPrefix.includes('@')) {
+                    queryPrefix = queryPrefix.split('@')[0];
+                }
+
+                console.log(`从Snapmail获取邮件: ${emailAddress} -> 使用前缀查询: ${queryPrefix}`);
+
                 const response = await axios.post(`${this.baseUrl}/emailList/filter`, {
                     key: this.apiKey,
-                    emailAddress: emailAddress,
+                    emailAddress: queryPrefix,
                     isPrefix: true,
                     page: 1,
                     count: 50
@@ -171,7 +235,7 @@ const EMAIL_SERVICES = {
             // 创建账户
             await axios.post(`${this.baseUrl}/accounts`, { address, password }, { timeout: 15000, validateStatus: ()=>true });
             // 获取token
-            const tokenResp = await axios.post(`${this.baseUrl}/token`, { address, password }, { timeout: 15000 });
+            const tokenResp = await axios.post(`${this.baseUrl}/token`, { address: address, password: password }, { timeout: 15000, validateStatus: ()=>true });
             const token = tokenResp.data && tokenResp.data.token;
             return { email: address, username: prefix, domain: domainObj.domain, token, service: 'mailtm', prefix };
         },
@@ -210,6 +274,78 @@ const EMAIL_SERVICES = {
         }
     },
     
+    'onesecmail': {
+        name: '1secmail',
+        baseUrl: 'https://www.1secmail.com/api/v1',
+        domains: ['1secmail.com','1secmail.org','1secmail.net','wwjmp.com','esiix.com','oosln.com','vddaz.com'],
+        status: 'unknown',
+        lastCheck: null,
+
+        // 1secmail 无需注册，直接使用 address 作为“token”标识
+        createEmail: async function(customPrefix) {
+            const prefix = customPrefix || generateUniqueKpayPrefix();
+            // 选择第一个域名
+            const domain = this.domains[0] || '1secmail.com';
+            const address = `${prefix}@${domain}`;
+            return { email: address, username: prefix, domain, token: address, service: 'onesecmail', prefix };
+        },
+
+        // 拉取邮件：list → read each
+        getEmails: async function(tokenOrAddress) {
+            try {
+                const address = tokenOrAddress;
+                const [login, domain] = String(address).split('@');
+                if (!login || !domain) return [];
+                const listUrl = `${this.baseUrl}/?action=getMessages&login=${encodeURIComponent(login)}&domain=${encodeURIComponent(domain)}`;
+                const listResp = await axios.get(listUrl, { timeout: 12000, validateStatus: () => true });
+                if (listResp.status !== 200 || !Array.isArray(listResp.data)) return [];
+
+                const emails = [];
+                for (const m of listResp.data) {
+                    try {
+                        const readUrl = `${this.baseUrl}/?action=readMessage&login=${encodeURIComponent(login)}&domain=${encodeURIComponent(domain)}&id=${encodeURIComponent(m.id)}`;
+                        const msg = await axios.get(readUrl, { timeout: 12000, validateStatus: () => true });
+                        if (msg.status === 200 && msg.data) {
+                            const d = msg.data;
+                            emails.push({
+                                id: `1secmail_${d.id}`,
+                                from: d.from || 'unknown@example.com',
+                                subject: d.subject || '无主题',
+                                date: d.date || new Date().toISOString(),
+                                text: d.textBody || d.text || '',
+                                html: d.htmlBody || '',
+                                textBody: d.textBody || d.text || '',
+                                service: 'onesecmail',
+                                to: d.to || address
+                            });
+                        }
+                    } catch (e) {
+                        // 单封失败忽略
+                    }
+                }
+                return emails;
+            } catch (e) {
+                return [];
+            }
+        },
+
+        checkStatus: async function() {
+            try {
+                // 官方 API 没有专门的健康检查，这里尝试读取公共域名列表接口（非官方）
+                // 退而求其次：请求一个必定 200 的地址（list 空用户）不抛错即视为可用
+                const url = `${this.baseUrl}/?action=getMessages&login=test&domain=1secmail.com`;
+                const resp = await axios.get(url, { timeout: 8000, validateStatus: () => true });
+                this.status = (resp.status === 200) ? 'active' : 'inactive';
+                this.lastCheck = new Date().toISOString();
+                return this.status === 'active';
+            } catch {
+                this.status = 'error';
+                this.lastCheck = new Date().toISOString();
+                return false;
+            }
+        }
+    },
+
     'guerrillamail': {
         name: 'GuerrillaMail',
         baseUrl: 'https://api.guerrillamail.com/ajax.php',
@@ -344,6 +480,14 @@ const EMAIL_SERVICES = {
     }
 };
 
+/**
+ * 简单内存缓存与索引
+ * EMAIL_CACHE: { accountId: { emails: [], lastFetched: isoString } }
+ * ACCOUNT_INDEX: { accountId: { email, service, token } }
+ */
+const EMAIL_CACHE = {};
+const ACCOUNT_INDEX = {};
+
 // 初始化存储文件
 function initStorage() {
     if (!fs.existsSync(EMAIL_STORAGE_FILE)) {
@@ -364,9 +508,23 @@ function readEmailStorage() {
     }
 }
 
+/**
+ * 尝试刷新内存索引
+ */
+function refreshAccountIndexFromStorage(storage) {
+    for (const [accountId, record] of Object.entries(storage)) {
+        ACCOUNT_INDEX[accountId] = {
+            email: record.email,
+            service: record.service,
+            token: record.token
+        };
+    }
+}
+
 // 写入邮件存储
 function writeEmailStorage(data) {
     fs.writeFileSync(EMAIL_STORAGE_FILE, JSON.stringify(data, null, 2));
+    refreshAccountIndexFromStorage(data);
 }
 
 // 读取服务状态
@@ -424,23 +582,14 @@ function isEmailPrefixUnique(prefix) {
 
 // 选择可用的邮件服务
 function selectAvailableService() {
-    const activeServices = Object.entries(EMAIL_SERVICES).filter(([key, service]) => service.status === 'active');
-    
-    if (activeServices.length === 0) {
-        // 优先使用Snapmail
-        return 'snapmail';
+    const order = ['mailtm', 'guerrillamail', 'onesecmail', 'snapmail'];
+    for (const k of order) {
+        const s = EMAIL_SERVICES[k];
+        if (s && s.status === 'active') return k;
     }
-    
-    // 优先选择Snapmail，如果可用的话
-    const snapmailActive = activeServices.find(([key]) => key === 'snapmail');
-    if (snapmailActive) {
-        return 'snapmail';
-    }
-    
-    // 否则随机选择一个活跃的服务
-    const randomIndex = Math.floor(Math.random() * activeServices.length);
-    return activeServices[randomIndex][0];
+    return 'mailtm';
 }
+ // 删除了重复的顺序块（已在上方的 selectAvailableService 正确实现）
 
 // API路由
 
@@ -520,14 +669,14 @@ app.post('/api/check-services', async (req, res) => {
 // 创建邮箱
 app.post('/api/create-email', async (req, res) => {
     try {
-        const { service: preferredService, customPrefix } = req.body;
+        const { service: preferredService, customPrefix, autoSelect } = req.body || {};
         
-        // 选择服务，优先使用Snapmail
-        let serviceKey = preferredService || selectAvailableService();
+        // 智能选择：优先 mailtm → onesecmail → guerrillamail → snapmail
+        let serviceKey = preferredService || (autoSelect ? selectAvailableService() : selectAvailableService());
         let service = EMAIL_SERVICES[serviceKey];
         
         if (!service) {
-            serviceKey = 'snapmail'; // 默认使用Snapmail
+            serviceKey = selectAvailableService(); // 默认使用智能顺序
             service = EMAIL_SERVICES[serviceKey];
         }
         
@@ -658,6 +807,83 @@ app.get('/api/emails', async (req, res) => {
     }
 });
 
+/**
+ * 读取缓存的邮件，如果没有缓存则尝试即时拉取一次
+ */
+app.get('/api/emails/cached', async (req, res) => {
+    try {
+        const { accountId } = req.query;
+        if (!accountId) {
+            return res.status(400).json({ success: false, message: '缺少accountId参数' });
+        }
+        const storage = readEmailStorage();
+        const account = storage[accountId];
+        if (!account) {
+            return res.status(404).json({ success: false, message: '找不到该账号' });
+        }
+
+        const cached = EMAIL_CACHE[accountId];
+        if (cached && Array.isArray(cached.emails)) {
+            return res.json({
+                success: true,
+                emails: cached.emails,
+                cachedAt: cached.lastFetched,
+                service: account.service
+            });
+        }
+
+        const service = EMAIL_SERVICES[account.service];
+        if (!service) {
+            return res.status(400).json({ success: false, message: '无法确定邮件服务类型' });
+        }
+        let result;
+        if (service.name === 'Snapmail') {
+            if (!account.email) {
+                return res.status(400).json({ success: false, message: 'Snapmail需要邮箱地址' });
+            }
+            result = await service.getEmails(account.token, account.email);
+        } else {
+            const list = await service.getEmails(account.token);
+            result = { success: true, emails: list };
+        }
+
+        if (result && result.success) {
+            EMAIL_CACHE[accountId] = {
+                emails: result.emails || [],
+                lastFetched: new Date().toISOString()
+            };
+            return res.json({
+                success: true,
+                emails: result.emails || [],
+                cachedAt: EMAIL_CACHE[accountId].lastFetched,
+                service: account.service
+            });
+        }
+        return res.status(502).json({ success: false, message: (result && result.message) || '第三方服务错误' });
+    } catch (e) {
+        console.error('读取缓存失败:', e.message);
+        res.status(500).json({ success: false, message: e.message || '读取缓存失败' });
+    }
+});
+
+/**
+ * 列出已创建账号（便于前端选择）
+ */
+app.get('/api/accounts', (req, res) => {
+    try {
+        const storage = readEmailStorage();
+        const list = Object.entries(storage).map(([id, v]) => ({
+            accountId: id,
+            email: v.email,
+            service: v.service,
+            createdAt: v.createdAt
+        }));
+        res.json({ success: true, accounts: list, count: list.length });
+    } catch (e) {
+        res.status(500).json({ success: false, message: '获取账号列表失败' });
+    }
+});
+
 // 获取可用域名
 app.get('/api/domains', async (req, res) => {
     try {
@@ -784,6 +1010,57 @@ async function initializeServices() {
     }
 }
 
+/**
+ * 后台轮询器：每10秒拉取所有账号邮件并缓存，同时写回存储
+ */
+let pollerStarted = false;
+async function startEmailPoller() {
+    if (pollerStarted) return;
+    pollerStarted = true;
+    console.log('启动后台邮件轮询器(每10秒)...');
+
+    const doPoll = async () => {
+        try {
+            const storage = readEmailStorage();
+            const entries = Object.entries(storage);
+            if (entries.length === 0) return;
+
+            for (const [accountId, acc] of entries) {
+                const service = EMAIL_SERVICES[acc.service];
+                if (!service) continue;
+
+                try {
+                    let result;
+                    if (service.name === 'Snapmail') {
+                        if (!acc.email) continue;
+                        result = await service.getEmails(acc.token, acc.email);
+                    } else {
+                        const list = await service.getEmails(acc.token);
+                        result = { success: true, emails: list };
+                    }
+
+                    if (result && result.success) {
+                        EMAIL_CACHE[accountId] = {
+                            emails: result.emails || [],
+                            lastFetched: new Date().toISOString()
+                        };
+                        storage[accountId].emails = result.emails || [];
+                        storage[accountId].lastUpdated = EMAIL_CACHE[accountId].lastFetched;
+                    }
+                } catch (e) {
+                    console.warn(`轮询 ${acc.email}(${acc.service}) 失败:`, e.message);
+                }
+            }
+            writeEmailStorage(storage);
+        } catch (e) {
+            console.warn('轮询器异常:', e.message);
+        }
+    };
+
+    doPoll();
+    setInterval(doPoll, 10000);
+}
+
 const HOST = process.env.HOST || '0.0.0.0';
 app.listen(PORT, HOST, async () => {
     const hostToShow = process.env.PUBLIC_HOST || 'localhost';
@@ -794,6 +1071,7 @@ app.listen(PORT, HOST, async () => {
     
     // 初始化服务状态
     await initializeServices();
+    await startEmailPoller();
     
     console.log('\n=== 服务初始化完成 ===');
     console.log('邮箱格式: kpay001@snapmail.cc');
